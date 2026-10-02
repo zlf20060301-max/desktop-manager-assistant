@@ -50,7 +50,11 @@ def main() -> int:
     (sandbox / "项目资料").mkdir()
     (sandbox / "项目资料" / "内部.docx").write_text("keep", encoding="utf-8")
 
-    cfg = Config(desktop_dir=str(sandbox), rules=Config().rules)
+    cfg = Config(
+        desktop_dir=str(sandbox),
+        rules=Config().rules,
+        path=tmp / "config.json",  # 关键：配置写回沙箱，不碰真实 config.json
+    )
     journal = Journal(tmp / "journal.json")
 
     print("1) 主窗口扫描沙箱目录")

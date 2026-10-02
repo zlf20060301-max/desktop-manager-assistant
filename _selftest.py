@@ -156,6 +156,19 @@ def main() -> int:
                          {"文档": "文档"}, sandbox, POLICY_RENAME)
     check(all(not p.runnable for p in plan6), "外部文件不会被归档进目标目录")
 
+    # ---------- 8. 配置写入隔离 ----------
+    print("\n8) 配置写入隔离（防止测试/多环境覆盖真实配置）")
+    from app.config import CONFIG_PATH, Config
+
+    before = CONFIG_PATH.read_bytes() if CONFIG_PATH.is_file() else None
+    cfg_file = tmp / "cfg" / "config.json"
+    c = Config(desktop_dir=str(sandbox), path=cfg_file)
+    c.save()
+    check(cfg_file.is_file(), "配置写到了指定的路径")
+    check(Config.load(cfg_file).desktop_dir == str(sandbox), "从指定路径能读回一致内容")
+    after = CONFIG_PATH.read_bytes() if CONFIG_PATH.is_file() else None
+    check(before == after, "真实 config.json 全程未被触碰")
+
     shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + "=" * 46)
     if FAILED:

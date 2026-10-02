@@ -88,15 +88,19 @@ class Config:
     conflict_policy: str = "rename"  # rename | skip | overwrite
     show_hidden: bool = False
     recursive: bool = False
+    # 这份配置是从哪个文件读出来的，保存时就写回哪里。
+    # 不能写死全局路径：否则测试、多套配置会互相覆盖。
+    path: Path = field(default_factory=lambda: CONFIG_PATH, repr=False, compare=False)
 
     # ---------- 读写 ----------
 
     @staticmethod
-    def load() -> "Config":
-        cfg = Config(desktop_dir=str(known_desktop()))
-        if CONFIG_PATH.is_file():
+    def load(path: Path | str | None = None) -> "Config":
+        cfg_path = Path(path) if path is not None else CONFIG_PATH
+        cfg = Config(desktop_dir=str(known_desktop()), path=cfg_path)
+        if cfg_path.is_file():
             try:
-                raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                raw = json.loads(cfg_path.read_text(encoding="utf-8"))
             except Exception:
                 raw = {}
             desktop = raw.get("desktop_dir")
@@ -116,7 +120,7 @@ class Config:
         return cfg
 
     def save(self) -> None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "desktop_dir": self.desktop_dir,
             "conflict_policy": self.conflict_policy,
@@ -124,11 +128,11 @@ class Config:
             "recursive": self.recursive,
             "rules": [r.as_dict() for r in self.rules],
         }
-        tmp = CONFIG_PATH.with_suffix(".json.tmp")
+        tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        tmp.replace(CONFIG_PATH)
+        tmp.replace(self.path)
 
     # ---------- 便捷访问 ----------
 
