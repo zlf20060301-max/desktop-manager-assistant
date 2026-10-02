@@ -89,17 +89,27 @@ def main() -> int:
     check(journal.last_undoable() is not None, "日志记录了可撤销批次")
 
     # ---------- 3. 重名冲突 ----------
-    print("\n3) 同名冲突处理")
+    print("\n3) 同名冲突处理：往名字后面直接加数字")
     (sandbox / "报告.docx").write_text("new", encoding="utf-8")
     entries2 = scan(sandbox)
     plan2 = plan_archive(entries2, {"文档": "文档"}, sandbox, POLICY_RENAME)
     tgt = [p for p in plan2 if p.runnable]
-    check(len(tgt) == 1 and tgt[0].dst.name == "报告 (1).docx", "重名自动改名 报告 (1).docx")
+    check(len(tgt) == 1 and tgt[0].dst.name == "报告1.docx", "归档重名自动改名 报告1.docx")
     up1 = unique_path(sandbox / "文档" / "报告.docx")
-    check(up1.name == "报告 (1).docx", "unique_path 对已存在文件加序号")
-    (sandbox / "文档" / "报告 (1).docx").write_text("dup", encoding="utf-8")
+    check(up1.name == "报告1.docx", "unique_path 对已存在文件加数字")
+    (sandbox / "文档" / "报告1.docx").write_text("dup", encoding="utf-8")
     up2 = unique_path(sandbox / "文档" / "报告.docx")
-    check(up2.name == "报告 (2).docx", "unique_path 序号递增到 (2)")
+    check(up2.name == "报告2.docx", "unique_path 数字递增到 2")
+    (sandbox / "文档" / "报告2.docx").write_text("dup", encoding="utf-8")
+    check(unique_path(sandbox / "文档" / "报告.docx").name == "报告3.docx", "unique_path 继续递增到 3")
+    # 名字末尾本来就是数字时不能黏在一起出歧义（2026报表 -> 2026报表1）
+    (sandbox / "文档" / "2026报表.docx").write_text("a", encoding="utf-8")
+    check(unique_path(sandbox / "文档" / "2026报表.docx").name == "2026报表1.docx",
+          "原名以数字结尾也能正确加数字")
+    # 多扩展名只动最后一段，保住 .gz
+    (sandbox / "文档" / "备份.tar.gz").write_text("a", encoding="utf-8")
+    check(unique_path(sandbox / "文档" / "备份.tar.gz").name == "备份.tar1.gz",
+          "多扩展名 备份.tar.gz -> 备份.tar1.gz")
 
     # ---------- 4. 撤销归档 ----------
     print("\n4) 撤销归档")
@@ -127,20 +137,73 @@ def main() -> int:
     check(res.ok == len(plan4), f"查找替换成功 {res.ok} 项")
     check((sandbox / "报告.docx").is_file(), "前缀已去除")
 
-    # ---------- 6. 编号 / 冲突防护 ----------
-    print("\n6) 编号与冲突防护")
-    files = [e for e in scan(sandbox) if e.name.endswith(".txt")]
-    plan5 = plan_rename(files, RenameOptions(mode="number", number_base="T", number_digits=3))
-    check(len(plan5) == len(files), "编号方案生成条目数一致")
-    if plan5:
-        print(f"     示例：{plan5[0].src.name} -> {plan5[0].dst.name}")
+    # ---------- 6. 批量重命名：撞名自动加数字 ----------
+    print("\n6) 批量重命名撞名自动加数字")
+    lab = sandbox / "改名测试"
+    lab.mkdir()
 
-    bad = plan_rename([e for e in scan(sandbox) if e.name == "报告.docx"],
+    def mk(name: str):
+        p = lab / name
+        p.write_text("x", encoding="utf-8")
+        return p
+
+    def plan_for(*names: str, **opts):
+        entries = [e for e in scan(lab) if e.name in names]
+        return plan_rename(entries, RenameOptions(**opts))
+
+    # A. 目标已存在磁盘上，且那个文件不会被执行改走 -> 加数字
+    mk("A.docx"); mk("B.docx")
+    pa = plan_for("A.docx", "B.docx", mode="replace", find="B", replace="A")
+    got = {p.src.name: p.dst.name for p in pa}
+    check(got.get("A.docx") == "A.docx", "名称未变的条目保持原样")
+    check(got.get("B.docx") == "A1.docx", f"撞已有文件 -> A1.docx（实际 {got.get('B.docx')}）")
+    for f in ("A.docx", "B.docx"):
+        (lab / f).unlink(missing_ok=True)
+
+    # B. 本批次内两条产生同一个名字 -> 第二条加数字
+    mk("报告A.docx"); mk("报告B.docx")
+    pb = plan_for("报告A.docx", "报告B.docx",
+                  mode="replace", find="[AB]", replace="X", use_regex=True)
+    names = sorted(p.dst.name for p in pb)
+    check(names == ["报告X.docx", "报告X1.docx"], f"批次内重名 -> {names}")
+    for f in ("报告A.docx", "报告B.docx"):
+        (lab / f).unlink(missing_ok=True)
+
+    # C. 链式依赖：a.txt 想改成 Xa.txt，而 Xa.txt 自己也要改名 —— 必须先腾位置
+    mk("a.txt"); mk("Xa.txt")
+    pc = plan_for("a.txt", "Xa.txt", mode="prefix", prefix="X")
+    got = {p.src.name: p.dst.name for p in pc}
+    order = [p.src.name for p in pc]
+    check(got.get("a.txt") == "Xa.txt", f"a.txt -> Xa.txt（实际 {got.get('a.txt')}）")
+    check(got.get("Xa.txt") == "XXa.txt", f"Xa.txt -> XXa.txt（实际 {got.get('Xa.txt')}）")
+    check(order.index("Xa.txt") < order.index("a.txt"), f"执行顺序先腾后占：{order}")
+    for f in ("a.txt", "Xa.txt"):
+        (lab / f).unlink(missing_ok=True)
+
+    # D. 名称没变的文件不会让位，别人不能指望它腾地方
+    mk("甲.txt"); mk("乙甲.txt")
+    pd = plan_for("甲.txt", "乙甲.txt", mode="replace", find="乙", replace="")
+    got = {p.src.name: p.dst.name for p in pd}
+    check(got.get("乙甲.txt") == "甲1.txt", f"未变的文件不让位 -> 甲1.txt（实际 {got.get('乙甲.txt')}）")
+    for f in ("甲.txt", "乙甲.txt"):
+        (lab / f).unlink(missing_ok=True)
+
+    # E. 真跑一遍，确认落盘结果和预览一致
+    mk("报告A.docx"); mk("报告B.docx")
+    pe = plan_for("报告A.docx", "报告B.docx",
+                  mode="replace", find="[AB]", replace="X", use_regex=True)
+    res = execute(pe, journal=journal, action="rename", note="撞名加数字")
+    check(res.ok == 2 and res.failed == 0, f"实际执行 {res.ok} 项，失败 {res.failed}")
+    check((lab / "报告X.docx").is_file() and (lab / "报告X1.docx").is_file(),
+          "落盘结果：报告X.docx + 报告X1.docx")
+
+    # F. 非法字符 / 空名字仍然拦截 —— 这类问题不该用加数字掩盖
+    bad = plan_rename([e for e in scan(lab) if e.name == "报告X.docx"],
                       RenameOptions(mode="replace", find="报告", replace="a/b"))
     check(not bad[0].runnable and bad[0].status == "conflict", "非法字符被拦截")
 
-    empty = plan_rename([e for e in scan(sandbox) if e.name == "报告.docx"],
-                        RenameOptions(mode="replace", find="报告.docx", replace=""))
+    empty = plan_rename([e for e in scan(lab) if e.name == "报告X.docx"],
+                        RenameOptions(mode="replace", find="报告X.docx", replace=""))
     check(not empty[0].runnable, "空名称被拦截")
 
     # ---------- 7. 越界防护 ----------

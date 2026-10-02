@@ -91,7 +91,10 @@ def _key(p: Path) -> str:
 
 
 def unique_path(dst: Path, taken: set[str] | None = None) -> Path:
-    """若目标已存在（或已被本批次占用），生成 "名字 (1).ext"。"""
+    """若目标已存在（或已被本批次占用），在名字后面直接接数字：报告.docx -> 报告1.docx。
+
+    数字从 1 开始递增，直到既不撞磁盘上的文件、也不撞本批次其它条目。
+    """
     taken = taken if taken is not None else set()
     if not dst.exists() and _key(dst) not in taken:
         return dst
@@ -100,7 +103,7 @@ def unique_path(dst: Path, taken: set[str] | None = None) -> Path:
     parent = dst.parent
     i = 1
     while True:
-        cand = parent / f"{stem} ({i}){suffix}"
+        cand = parent / f"{stem}{i}{suffix}"
         if not cand.exists() and _key(cand) not in taken:
             return cand
         i += 1
@@ -159,7 +162,7 @@ def plan_archive(
                 taken.add(_key(dst))
                 continue
             new_dst = unique_path(dst, taken)
-            plan.append(PlanItem(e.path, new_dst, STATUS_OK, "目标重名，已自动改名"))
+            plan.append(PlanItem(e.path, new_dst, STATUS_OK, "重名，已自动加数字"))
             taken.add(_key(new_dst))
             continue
 
@@ -240,15 +243,40 @@ def _new_name(name: str, opts: RenameOptions, index: int) -> str:
     return name
 
 
+def _name_error(new_name: str, old_name: str) -> str | None:
+    """检查新名字是否可用。名称没变化不算错误。"""
+    if new_name == old_name:
+        return None
+    if not new_name.strip() or new_name in (".", ".."):
+        return "新名称为空，已跳过"
+    if any(ch in new_name for ch in '\\/:*?"<>|'):
+        return "新名称含非法字符，已跳过"
+    return None
+
+
 def plan_rename(entries: Sequence[Entry], opts: RenameOptions) -> list[PlanItem]:
-    """规划批量重命名。同批次内重名会被标记为冲突并跳过。"""
+    """规划批量重命名。
+
+    重名不再跳过，而是在名字后面直接加数字：报告.docx -> 报告1.docx。
+    两种情况都算重名：本批次内别的条目已经占了这个名字，或者磁盘上
+    本来就有这个文件（且它不会被本批次改走）。
+    """
     # 先按目录 + 名称排序，保证编号稳定且符合直觉
     ordered = sorted(entries, key=lambda e: (_key(e.path.parent), e.name.lower()))
+    raw = [(e, _new_name(e.name, opts, idx)) for idx, e in enumerate(ordered)]
+
+    # 只有"真的会被改走、且新名字合法"的条目才会腾出位置。
+    # 名称未变的条目不会动，所以别的条目不能指望它让位。
+    vacating = {
+        _key(e.path)
+        for e, n in raw
+        if n != e.name and _name_error(n, e.name) is None
+    }
+
     plan: list[PlanItem] = []
     used: dict[str, set[str]] = {}
 
-    for idx, e in enumerate(ordered):
-        new_name = _new_name(e.name, opts, idx)
+    for e, new_name in raw:
         dst = e.path.parent / new_name
         bucket = used.setdefault(_key(e.path.parent), set())
 
@@ -256,23 +284,46 @@ def plan_rename(entries: Sequence[Entry], opts: RenameOptions) -> list[PlanItem]
             plan.append(PlanItem(e.path, dst, STATUS_SKIP, "名称未变化"))
             bucket.add(_key(dst))
             continue
-        if not new_name.strip() or new_name in (".", ".."):
-            plan.append(PlanItem(e.path, dst, STATUS_CONFLICT, "新名称为空，已跳过"))
-            continue
-        if any(ch in new_name for ch in '\\/:*?"<>|'):
-            plan.append(PlanItem(e.path, dst, STATUS_CONFLICT, "新名称含非法字符，已跳过"))
-            continue
-        if new_name != e.name and e.path.with_name(new_name).exists():
-            plan.append(PlanItem(e.path, dst, STATUS_CONFLICT, "目标名称已存在，已跳过"))
-            continue
-        if _key(dst) in bucket:
-            plan.append(PlanItem(e.path, dst, STATUS_CONFLICT, "本批次内名称重复，已跳过"))
+
+        err = _name_error(new_name, e.name)
+        if err is not None:
+            plan.append(PlanItem(e.path, dst, STATUS_CONFLICT, err))
             continue
 
-        plan.append(PlanItem(e.path, dst, STATUS_OK))
+        blocked = _key(dst) in bucket or (dst.exists() and _key(dst) not in vacating)
+        if blocked:
+            dst = unique_path(dst, bucket)
+            plan.append(PlanItem(e.path, dst, STATUS_OK, "重名，已自动加数字"))
+        else:
+            plan.append(PlanItem(e.path, dst, STATUS_OK))
         bucket.add(_key(dst))
 
-    return plan
+    return _order_renames(plan)
+
+
+def _order_renames(plan: list[PlanItem]) -> list[PlanItem]:
+    """消除先后依赖：若 A 的目标正好是 B 现在的名字，必须先把 B 改走。
+
+    没有依赖的保持原顺序；万一出现环（比如两个文件互换名字），保持原顺序，
+    由 execute() 的同名保护兜底——最坏情况是跳过，不会丢文件。
+    """
+    by_src = {_key(p.src): p for p in plan}
+    remaining = list(plan)
+    out: list[PlanItem] = []
+    done: set[str] = set()
+
+    changed = True
+    while remaining and changed:
+        changed = False
+        for p in list(remaining):
+            blocker = by_src.get(_key(p.dst))
+            if blocker is None or blocker is p or _key(blocker.src) in done:
+                out.append(p)
+                done.add(_key(p.src))
+                remaining.remove(p)
+                changed = True
+    out.extend(remaining)
+    return out
 
 
 # --------------------------------------------------------------------------

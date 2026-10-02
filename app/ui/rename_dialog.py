@@ -89,7 +89,7 @@ class RenameDialog(QDialog):
         root.addWidget(self.stack)
 
         # ---------- 预览 ----------
-        title = QLabel("预览（灰色=不处理，红色=冲突跳过）")
+        title = QLabel("预览（灰色=不处理，重名会自动在名字后面加数字）")
         title.setObjectName("SectionTitle")
         root.addWidget(title)
 
@@ -254,13 +254,13 @@ class RenameDialog(QDialog):
         self.preview.setRowCount(len(self.plan))
         for r, item in enumerate(self.plan):
             if item.status == STATUS_OK:
-                badge = "✔ 改名"
+                badge = "✔ 加数字" if item.message else "✔ 改名"
                 color = Qt.GlobalColor.darkGreen
             elif item.status == STATUS_SKIP:
                 badge = "— 不变"
                 color = Qt.GlobalColor.gray
             else:
-                badge = "✖ 冲突"
+                badge = "✖ 跳过"
                 color = Qt.GlobalColor.red
             cells = [badge, item.src.name, item.dst.name, item.message]
             for c, text in enumerate(cells):
