@@ -38,6 +38,10 @@ desktop.ini
 $RECYCLE.BIN/
 *.lnk
 
+# ---------- 打包产物 ----------
+*.spec
+installer/output/
+
 # ---------- 临时文件 ----------
 *.tmp
 *.bak

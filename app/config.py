@@ -4,14 +4,33 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .categorizer import CATEGORY_ORDER, DEFAULT_TARGETS
 
 APP_DIR = Path(__file__).resolve().parent.parent
-CONFIG_PATH = APP_DIR / "config.json"
-DATA_DIR = APP_DIR / "data"
+
+# 打包成 exe 之后，__file__ 指向的是 PyInstaller 的临时解包目录，
+# 每次运行都不一样、而且只读，绝不能拿来存配置。
+#   源码运行 -> 数据放项目目录（开发和测试都方便）
+#   冻结运行 -> 数据放 %APPDATA%\桌面管理助手\
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def _data_root() -> Path:
+    if not IS_FROZEN:
+        return APP_DIR
+    base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    if base and Path(base).is_dir():
+        return Path(base) / "桌面管理助手"
+    return Path.home() / "桌面管理助手"
+
+
+DATA_ROOT = _data_root()
+CONFIG_PATH = DATA_ROOT / "config.json"
+DATA_DIR = DATA_ROOT / "data"
 JOURNAL_PATH = DATA_DIR / "undo_journal.json"
 
 # 默认不参与归档的分类（交给用户按需打开）
