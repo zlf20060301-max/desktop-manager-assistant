@@ -1,0 +1,43 @@
+# ---------- 虚拟环境（656MB，绝不提交）----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- 本机配置与运行数据 ----------
+# config.json 里含本机桌面绝对路径，每个人的都不一样，不进仓库
+config.json
+config.json.tmp
+data/
+*.log
+
+# ---------- 编辑器 / IDE ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---------- Windows ----------
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ---------- 临时文件 ----------
+*.tmp
+*.bak

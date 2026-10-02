@@ -1,0 +1,20 @@
+{
+  "_说明": "这是配置范例。程序首次运行会自动生成 config.json，不需要手动创建这个文件。",
+  "desktop_dir": "C:\\Users\\你的用户名\\Desktop",
+  "conflict_policy": "rename",
+  "show_hidden": false,
+  "recursive": false,
+  "rules": [
+    { "category": "文档", "target": "文档", "enabled": true },
+    { "category": "表格", "target": "表格", "enabled": true },
+    { "category": "演示", "target": "演示", "enabled": true },
+    { "category": "PDF", "target": "PDF", "enabled": true },
+    { "category": "图片", "target": "图片", "enabled": true },
+    { "category": "音视频", "target": "音视频", "enabled": true },
+    { "category": "压缩包", "target": "压缩包", "enabled": true },
+    { "category": "程序", "target": "安装包", "enabled": true },
+    { "category": "代码", "target": "代码", "enabled": true },
+    { "category": "快捷方式", "target": "快捷方式", "enabled": false },
+    { "category": "其他", "target": "其他", "enabled": false }
+  ]
+}

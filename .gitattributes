@@ -1,0 +1,11 @@
+# 统一换行符，避免跨平台克隆后出现整文件 diff
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF，否则个别环境下会出问题
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
