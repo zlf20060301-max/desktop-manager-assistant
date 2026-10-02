@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -29,11 +30,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import DATA_DIR, Config
+from ..categorizer import CategoryMap
+from ..config import DATA_DIR, Config, merge_missing_categories
 from ..content_index import ContentIndex, describe_status, index_path_for
 from ..fileops import is_within, recycle, undo_batch
 from ..journal import Journal
-from ..scanner import Entry, category_counts, human_size, scan
+from ..scanner import Entry, category_counts, human_size, scan_with_meta
+
+# 递归扫描的硬上限。桌面上往往是几万项（比如一整棵代码仓库），
+# 不设限会让界面和内容索引都卡死。超出的部分会被截断，界面上会明说。
+RECURSIVE_MAX_ITEMS = 20000
+
+# 首次建立内容索引时，超过这个文档数就先问一句。
+# 打开「含子文件夹」后动辄上万个文档，不打招呼就开跑会读掉好几 GB。
+LARGE_INDEX_WARN = 1000
 from .archive_dialog import ArchiveDialog
 from .file_model import (
     COL_CAT,
@@ -46,9 +56,10 @@ from .file_model import (
     EntryFilterProxy,
     FileTableModel,
 )
+from .filetype_dialog import FileTypeDialog
 from .indexer import IndexWorker
 from .rename_dialog import RenameDialog
-from .theme import QSS, category_icon
+from .theme import QSS
 
 SEARCH_PLACEHOLDER = "搜索文件名 / 分类 / 路径…（Ctrl+F）"
 SEARCH_PLACEHOLDER_CONTENT = "搜索文件名 / 分类 / 路径 / 文档正文…（Ctrl+F）"
@@ -66,7 +77,10 @@ class MainWindow(QMainWindow):
         self.journal = journal if journal is not None else Journal()
         # 内容索引库放哪。测试和多套环境可以指到别处，避免污染真实索引。
         self._data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
+        # 分类映射：内置表 + 用户自定义的后缀/分类
+        self.cats = CategoryMap.from_config(cfg)
         self.entries: list[Entry] = []
+        self._truncated = False
 
         # 内容搜索相关状态。索引库按需创建，不用内容搜索就不建库。
         self._index: ContentIndex | None = None
@@ -98,6 +112,7 @@ class MainWindow(QMainWindow):
 
         # 模型必须先于动作栏建立：动作栏的复选框要连到代理上
         self.model = FileTableModel([])
+        self.model.set_category_map(self.cats)
         self.proxy = EntryFilterProxy()
         self.proxy.setSourceModel(self.model)
 
@@ -181,6 +196,11 @@ class MainWindow(QMainWindow):
         self.lbl_path.setObjectName("AppPath")
         h.addWidget(self.lbl_path, 1)
 
+        btn_types = QPushButton("文件类型")
+        btn_types.setToolTip("管理分类与文件后缀，可从本机已安装的软件扫描导入")
+        btn_types.clicked.connect(self.open_filetype_dialog)
+        h.addWidget(btn_types)
+
         btn_choose = QPushButton("切换目录")
         btn_choose.clicked.connect(self.choose_directory)
         h.addWidget(btn_choose)
@@ -221,6 +241,16 @@ class MainWindow(QMainWindow):
         self.chk_hidden.setChecked(self.cfg.show_hidden)
         self.chk_hidden.toggled.connect(self._on_hidden_toggled)
         h.addWidget(self.chk_hidden)
+
+        self.chk_recursive = QCheckBox("含子文件夹")
+        self.chk_recursive.setToolTip(
+            "连子文件夹里的文件一起列出来（广度优先，最多 "
+            f"{RECURSIVE_MAX_ITEMS:,} 项）。\n"
+            "归档操作仍然只处理直接放在桌面上的文件，不会动子目录里的东西。"
+        )
+        self.chk_recursive.setChecked(self.cfg.recursive)
+        self.chk_recursive.toggled.connect(self._on_recursive_toggled)
+        h.addWidget(self.chk_recursive)
 
         h.addStretch(1)
 
@@ -277,14 +307,19 @@ class MainWindow(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.entries = scan(
+            result = scan_with_meta(
                 root,
                 recursive=self.cfg.recursive,
                 show_hidden=self.cfg.show_hidden,
                 include_dirs=True,
+                categorizer=self.cats,
+                max_items=RECURSIVE_MAX_ITEMS if self.cfg.recursive else None,
             )
         finally:
             QApplication.restoreOverrideCursor()
+
+        self.entries = result.entries
+        self._truncated = result.truncated
 
         self.model.set_entries(self.entries)
         self.lbl_path.setText(f"当前目录：{root}")
@@ -310,13 +345,11 @@ class MainWindow(QMainWindow):
         item.setData(Qt.ItemDataRole.UserRole, None)
         self.cat_list.addItem(item)
 
-        from ..categorizer import CATEGORY_ORDER
-
-        for cat in CATEGORY_ORDER:
+        for cat in self.cats.categories():
             n = counts.get(cat, 0)
             if n == 0:
                 continue
-            it = QListWidgetItem(f"{category_icon(cat)}  {cat}           {n}")
+            it = QListWidgetItem(f"{self.cats.icon(cat)}  {cat}           {n}")
             it.setData(Qt.ItemDataRole.UserRole, cat)
             self.cat_list.addItem(it)
 
@@ -369,6 +402,14 @@ class MainWindow(QMainWindow):
         self.cfg.save()
         self.rescan()
 
+    def _on_recursive_toggled(self, flag: bool) -> None:
+        self.cfg.recursive = bool(flag)
+        self.cfg.save()
+        if flag:
+            self.status.showMessage("正在扫描子文件夹，项目多的话要等一会儿…", 0)
+        self.rescan()
+        self.status.clearMessage()
+
     def _on_selection_changed(self, *_args) -> None:
         self._update_status()
         self._update_info_bar()
@@ -392,6 +433,11 @@ class MainWindow(QMainWindow):
         return self._index
 
     def _on_content_toggled(self, flag: bool) -> None:
+        if flag and not self._confirm_index_scale(first_time=self._index is None):
+            # 用户觉得量太大，撤销这次勾选
+            self.chk_content.setChecked(False)
+            return
+
         self.cfg.content_search = bool(flag)
         self.cfg.save()
 
@@ -412,6 +458,35 @@ class MainWindow(QMainWindow):
             self.status.clearMessage()
             self._update_status()
             self._update_info_bar()
+
+    def _searchable_count(self) -> int:
+        from ..extract import is_supported
+
+        return sum(1 for e in self.entries if not e.is_dir and is_supported(e.ext))
+
+    def _confirm_index_scale(self, *, first_time: bool) -> bool:
+        """要索引的文档太多时先确认，别闷头读掉几个 GB。"""
+        if not first_time:
+            return True
+        pending = self._searchable_count()
+        if pending <= LARGE_INDEX_WARN:
+            return True
+        extra = ""
+        if self.cfg.recursive:
+            extra = "\n（「含子文件夹」开着，所以数量会很大）"
+        ok = QMessageBox.question(
+            self,
+            "内容索引范围较大",
+            f"当前范围里有 {pending:,} 个可以搜索正文的文档，"
+            "首次建立索引需要逐个读取它们，可能要几分钟到十几分钟，"
+            f"并占用一些磁盘空间。{extra}\n\n"
+            "索引是增量的：这次建好之后，以后只处理改动过的文件。\n\n"
+            "确定现在开始建立索引吗？\n"
+            "（选「否」会关闭「搜内容」，你随时可以再打开）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return ok == QMessageBox.StandardButton.Yes
 
     def start_indexing(self, *, force: bool = False) -> None:
         """在后台把新增/改动过的文档补进索引。"""
@@ -444,10 +519,28 @@ class MainWindow(QMainWindow):
             worker.wait(3000)        # 确认线程真的退出了再回收，避免 Qt 警告
             worker.deleteLater()
         self.status.clearMessage()
+        self._prune_index()
         if added or failed:
             self._run_content_search()   # 索引进度变了，重跑一次当前查询
         self._update_status()
         self._update_info_bar()
+
+    def _prune_index(self) -> None:
+        """清掉当前目录下已经不存在、或已经不在扫描范围内的索引记录。
+
+        没有这一步的话索引会只增不减：像「含子文件夹」打开过一次，
+        那上万条深层记录的正文就会一直留在库里占着几十 MB。
+        """
+        if self._index is None or not self.entries:
+            return
+        try:
+            removed = self._index.prune(
+                Path(self.cfg.desktop_dir), [e.path for e in self.entries]
+            )
+            if removed:
+                self.status.showMessage(f"已清理 {removed} 条过期索引记录", 4000)
+        except Exception:  # noqa: BLE001 - 清理失败不影响使用
+            pass
 
     def _run_content_search(self) -> None:
         query = self.search.text().strip()
@@ -485,8 +578,11 @@ class MainWindow(QMainWindow):
         )
         if ok != QMessageBox.StandardButton.Yes:
             return
+        if not self._confirm_index_scale(first_time=True):
+            return
         if not self.chk_content.isChecked():
             self.chk_content.setChecked(True)
+            return                      # setChecked 会走一遍开启流程
         self.start_indexing(force=True)
         self.status.showMessage("正在重建内容索引…", 0)
 
@@ -497,9 +593,14 @@ class MainWindow(QMainWindow):
         total = self.proxy.rowCount() if hasattr(self, "proxy") else 0
 
         lines: list[str] = []
+        if self._truncated:
+            lines.append(
+                f"⚠ 项目太多，只列出了前 {RECURSIVE_MAX_ITEMS:,} 项（浅层优先）。"
+                "想看全的话，用「切换目录」直接指向那个子文件夹。"
+            )
         if content_on and total == 0 and query:
             lines.append("没有找到包含该内容的文档。")
-        elif not content_on and total == 0:
+        elif not content_on and total == 0 and not lines:
             lines.append("没有匹配的条目，试试清空搜索或切换分类。")
 
         selected = self.selected_entries() if hasattr(self, "table") else []
@@ -528,6 +629,8 @@ class MainWindow(QMainWindow):
         text = f"共 {all_count} 项"
         if total != all_count:
             text += f"（当前筛选 {total} 项）"
+        if self._truncated:
+            text += f" · ⚠ 已达 {RECURSIVE_MAX_ITEMS:,} 项上限，结果被截断"
         if self.chk_content.isChecked() and self._hits:
             text += f" · 内容命中 {len(self._hits)} 个文档"
         text += f" · 占用 {human_size(size)} · 目录 {self.cfg.desktop_dir}"
@@ -546,6 +649,24 @@ class MainWindow(QMainWindow):
             self.cfg.desktop_dir = chosen
             self.cfg.save()
             self.rescan()
+
+    def open_filetype_dialog(self) -> None:
+        """管理分类与后缀。改完要重建分类映射并重新扫描。"""
+        dlg = FileTypeDialog(self.cfg, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not dlg.changed:
+            return
+        self._reload_categories()
+
+    def _reload_categories(self) -> None:
+        self.cats = CategoryMap.from_config(self.cfg)
+        self.model.set_category_map(self.cats)
+        # 新增的分类要能出现在归档规则里
+        self.cfg.rules = merge_missing_categories(self.cfg.rules, self.cats.categories())
+        self.cfg.save()
+        self.rescan()
+        self.status.showMessage("文件类型设置已更新", 4000)
 
     # ------------------------------------------------------------------
 
@@ -575,7 +696,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def open_archive_dialog(self) -> None:
-        dlg = ArchiveDialog(self.cfg, self.entries, self.journal, self)
+        dlg = ArchiveDialog(self.cfg, self.entries, self.journal, self, cats=self.cats)
         dlg.exec()
         if dlg.executed:
             self.rescan()

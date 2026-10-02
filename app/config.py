@@ -85,9 +85,11 @@ class ArchiveRule:
         )
 
 
-def default_rules() -> list[ArchiveRule]:
+def default_rules(categories: list[str] | None = None) -> list[ArchiveRule]:
+    """按分类生成默认归档规则。categories 不传就用内置分类。"""
+    cats = list(categories) if categories is not None else list(CATEGORY_ORDER)
     rules: list[ArchiveRule] = []
-    for cat in CATEGORY_ORDER:
+    for cat in cats:
         if cat == "文件夹":
             continue
         rules.append(
@@ -100,6 +102,20 @@ def default_rules() -> list[ArchiveRule]:
     return rules
 
 
+def merge_missing_categories(
+    rules: list[ArchiveRule], categories: list[str] | None = None
+) -> list[ArchiveRule]:
+    """补齐新版本新增的分类（以及用户新建的分类），并按分类顺序归一。"""
+    cats = list(categories) if categories is not None else list(CATEGORY_ORDER)
+    have = {r.category for r in rules}
+    for r in default_rules(cats):
+        if r.category not in have:
+            rules.append(r)
+    order = {c: i for i, c in enumerate(cats)}
+    rules.sort(key=lambda r: order.get(r.category, 999))
+    return rules
+
+
 @dataclass
 class Config:
     desktop_dir: str = ""
@@ -108,6 +124,9 @@ class Config:
     show_hidden: bool = False
     recursive: bool = False
     content_search: bool = False     # 是否默认开启「搜索文件内容」
+    # 用户在「文件类型管理」里自定义的分类与后缀映射
+    custom_categories: list[dict] = field(default_factory=list)
+    ext_overrides: dict[str, str] = field(default_factory=dict)
     # 这份配置是从哪个文件读出来的，保存时就写回哪里。
     # 不能写死全局路径：否则测试、多套配置会互相覆盖。
     path: Path = field(default_factory=lambda: CONFIG_PATH, repr=False, compare=False)
@@ -129,12 +148,28 @@ class Config:
             desktop = raw.get("desktop_dir")
             if desktop and Path(desktop).is_dir():
                 cfg.desktop_dir = str(desktop)
+
+            # 先读自定义分类与后缀，再合并规则 —— 规则表要能包含用户新建的分类
+            custom = raw.get("custom_categories")
+            if isinstance(custom, list):
+                cfg.custom_categories = [
+                    c for c in custom if isinstance(c, dict) and c.get("name")
+                ]
+            overrides = raw.get("ext_overrides")
+            if isinstance(overrides, dict):
+                cfg.ext_overrides = {
+                    str(k).lower(): str(v)
+                    for k, v in overrides.items()
+                    if str(k).strip() and str(v).strip()
+                }
+
             rules_raw = raw.get("rules")
             if isinstance(rules_raw, list) and rules_raw:
                 cfg.rules = [
                     ArchiveRule.from_dict(r) for r in rules_raw if isinstance(r, dict)
                 ]
-                cfg.rules = _merge_missing_categories(cfg.rules)
+                cfg.rules = merge_missing_categories(cfg.rules, cfg.all_categories())
+
             pol = raw.get("conflict_policy")
             if pol in ("rename", "skip", "overwrite"):
                 cfg.conflict_policy = pol
@@ -151,6 +186,8 @@ class Config:
             "show_hidden": self.show_hidden,
             "recursive": self.recursive,
             "content_search": self.content_search,
+            "custom_categories": self.custom_categories,
+            "ext_overrides": self.ext_overrides,
             "rules": [r.as_dict() for r in self.rules],
         }
         tmp = self.path.with_suffix(".json.tmp")
@@ -164,6 +201,12 @@ class Config:
     @property
     def root(self) -> Path:
         return Path(self.desktop_dir)
+
+    def all_categories(self) -> list[str]:
+        """内置分类 + 用户自定义分类，顺序可直接用于界面。"""
+        from .categorizer import CategoryMap
+
+        return CategoryMap.from_config(self).categories()
 
     def rule_map(self) -> dict[str, ArchiveRule]:
         return {r.category: r for r in self.rules}
@@ -179,11 +222,5 @@ class Config:
 
 
 def _merge_missing_categories(rules: list[ArchiveRule]) -> list[ArchiveRule]:
-    """配置缺了新版本的分类时补齐，顺序按 CATEGORY_ORDER 归一。"""
-    have = {r.category for r in rules}
-    for r in default_rules():
-        if r.category not in have:
-            rules.append(r)
-    order = {c: i for i, c in enumerate(CATEGORY_ORDER)}
-    rules.sort(key=lambda r: order.get(r.category, 999))
-    return rules
+    """兼容旧调用点。"""
+    return merge_missing_categories(rules)

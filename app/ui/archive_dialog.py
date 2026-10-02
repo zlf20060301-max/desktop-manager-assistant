@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..categorizer import CategoryMap
 from ..config import Config
 from ..fileops import (
     POLICY_LABELS,
@@ -33,7 +34,6 @@ from ..fileops import (
 )
 from ..journal import Journal
 from ..scanner import Entry
-from .theme import category_icon
 
 
 class ArchiveDialog(QDialog):
@@ -45,11 +45,13 @@ class ArchiveDialog(QDialog):
         entries: list[Entry],
         journal: Journal,
         parent: QWidget | None = None,
+        cats: CategoryMap | None = None,
     ) -> None:
         super().__init__(parent)
         self.cfg = cfg
         self.entries = entries
         self.journal = journal
+        self.cats = cats or CategoryMap.from_config(cfg)
         self.plan = []
         self.executed = 0
 
@@ -147,7 +149,7 @@ class ArchiveDialog(QDialog):
         self.rule_table.blockSignals(True)
         self.rule_table.setRowCount(len(self.cfg.rules))
         for i, rule in enumerate(self.cfg.rules):
-            cat_item = QTableWidgetItem(f"{category_icon(rule.category)} {rule.category}")
+            cat_item = QTableWidgetItem(f"{self.cats.icon(rule.category)} {rule.category}")
             cat_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.rule_table.setItem(i, 0, cat_item)
             self.rule_table.setItem(i, 1, QTableWidgetItem(rule.target))

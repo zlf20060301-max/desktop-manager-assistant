@@ -367,6 +367,143 @@ def main() -> int:
     after = CONFIG_PATH.read_bytes() if CONFIG_PATH.is_file() else None
     check(before == after, "真实 config.json 全程未被触碰")
 
+    # ---------- 10. 专业软件分类与自定义文件类型 ----------
+    print("\n10) 专业软件分类与自定义文件类型")
+    from app.categorizer import (
+        CATEGORY_ORDER,
+        PRO_CATEGORIES,
+        CategoryMap,
+        suggest_category,
+    )
+    from app.config import merge_missing_categories
+
+    m = CategoryMap()
+    pro_cases = {
+        "零件.SLDPRT": "三维模型", "装配体.sldasm": "三维模型",
+        "工程图.slddrw": "三维模型", "模型.step": "三维模型",
+        "网格.stl": "三维模型", "草图.3dm": "三维模型",
+        "图纸.dwg": "CAD图纸", "布局.dxf": "CAD图纸", "出图.plt": "CAD图纸",
+        "分析.inp": "仿真分析", "工作台.wbpj": "仿真分析", "网格.msh": "仿真分析",
+        "原理图.schdoc": "电子设计", "板子.pcbdoc": "电子设计", "打样.gtl": "电子设计",
+        "海报.psd": "设计源文件", "矢量.ai": "设计源文件", "排版.indd": "设计源文件",
+        "剪辑.prproj": "影音工程", "特效.aep": "影音工程", "工程.flp": "影音工程",
+        "数据.mat": "科学计算", "模型.slx": "科学计算", "统计.sav": "科学计算",
+    }
+    wrong = {k: m.categorize(k) for k, v in pro_cases.items() if m.categorize(k) != v}
+    check(not wrong, f"专业软件后缀 {len(pro_cases)} 项全部识别正确（错的：{wrong}）")
+    check(m.categorize("零件.sldprt") == "三维模型", "后缀大小写不敏感")
+    check(len(CATEGORY_ORDER) >= 19, f"分类数 {len(CATEGORY_ORDER)}")
+    check(all(c in CATEGORY_ORDER for c in PRO_CATEGORIES), "专业分类都在分类表里")
+    # 老分类不能被改坏
+    check(m.categorize("论文.docx") == "文档" and m.categorize("照片.jpg") == "图片"
+          and m.categorize("脚本.py") == "代码", "原有分类没有被改坏")
+
+    # ---- 用户自定义 ----
+    cm = CategoryMap(
+        overrides={".psd": "我的设计稿", ".zzq": "我的设计稿", ".inp": "其他"},
+        custom_categories=[{"name": "我的设计稿", "icon": "⭐"}],
+    )
+    check(cm.categorize("海报.psd") == "我的设计稿", "自定义后缀覆盖内置分类")
+    check(cm.categorize("某某.zzq") == "我的设计稿", "自定义的新后缀生效")
+    check(cm.categorize("分析.inp") == "其他", "可以把内置后缀覆盖成「其他」")
+    check(cm.categorize("论文.docx") == "文档", "没覆盖的仍按内置规则")
+    check(cm.is_custom("我的设计稿") and not cm.is_custom("文档"), "自定义分类标记正确")
+    check("我的设计稿" in cm.categories(), "自定义分类出现在分类列表里")
+    check(cm.categories()[-1] == "其他", "「其他」始终排在最后")
+    check(cm.icon("我的设计稿") == "⭐" and cm.icon("文档") == "📄", "自定义图标与内置图标都对")
+
+    overrides = cm.to_overrides(cm.effective_ext_map())
+    check(overrides.get(".psd") == "我的设计稿", "差异被记录进配置")
+    check(".docx" not in overrides, "与内置一致的项不入配置（否则配置会肿到几百行）")
+    check(len(overrides) < 10, f"压缩后只有 {len(overrides)} 项覆盖")
+
+    # ---- 用自定义映射扫描 ----
+    custom_dir = tmp / "自定义分类测试"
+    custom_dir.mkdir()
+    for name in ("海报.psd", "未知.zzq", "论文.docx"):
+        (custom_dir / name).write_text("x", encoding="utf-8")
+    got = {e.name: e.category for e in scan(custom_dir, categorizer=cm)}
+    check(got.get("海报.psd") == "我的设计稿" and got.get("未知.zzq") == "我的设计稿",
+          f"扫描时确实用了自定义映射（{got}）")
+    plain = {e.name: e.category for e in scan(custom_dir)}
+    check(plain.get("海报.psd") == "设计源文件", "不传映射时仍用内置规则")
+    check(plain.get("未知.zzq") == "其他", "内置表里没有的后缀归「其他」")
+
+    # ---- 从注册表记录猜分类 ----
+    check(suggest_category(".zzz", "SolidWorks Part Document", "SLDWORKS.exe") == "三维模型",
+          "按类型名关键词猜出三维模型")
+    check(suggest_category(".zzz", "Ansys 2024 R1 .inp File", "RunWB2.exe") == "仿真分析",
+          "按类型名关键词猜出仿真分析")
+    check(suggest_category(".zzz", "Adobe Photoshop Image", "Photoshop.exe") == "设计源文件",
+          "按程序名关键词猜出设计源文件")
+    check(suggest_category(".zzz", "某个无关类型", "notepad.exe") == "", "猜不出时返回空串")
+    check(suggest_category(".dwg", "", "") == "CAD图纸", "扩展名精确命中优先于关键词")
+
+    # ---- 规则表要包含自定义分类 ----
+    rules = merge_missing_categories([], cm.categories())
+    cats_in_rules = {r.category for r in rules}
+    check("我的设计稿" in cats_in_rules, "自定义分类也会生成归档规则")
+    check("文件夹" not in cats_in_rules, "「文件夹」不生成归档规则")
+    check(len(rules) == len(cm.categories()) - 1, "规则数 = 分类数 - 1（去掉文件夹）")
+
+    # ---- 注册表发现（仅 Windows）----
+    from app import winfiletypes
+
+    if winfiletypes.available():
+        found = winfiletypes.discover()
+        check(len(found) > 100, f"从注册表发现 {len(found)} 种本机文件类型")
+        check(all(i.ext.startswith(".") and i.ext == i.ext.lower() for i in found),
+              "扩展名统一成小写带点")
+        short = [i for i in found if "~" in i.app]
+        check(not short, f"8.3 短名已展开成长名（残留 {len(short)} 个）")
+        check(len([i for i in found if i.app]) > 50,
+              f"{len([i for i in found if i.app])} 种能定位到关联程序")
+        check(len([i for i in found if i.type_name]) > 50,
+              f"{len([i for i in found if i.type_name])} 种有人可读的类型名")
+        # 本机装的专业软件应该被认出来
+        by_ext = {i.ext: i for i in found}
+        sw = by_ext.get(".sldprt")
+        if sw is not None:
+            check("SOLIDWORKS" in (sw.type_name + sw.app).upper()
+                  or "SW" in sw.app.upper(),
+                  f"识别出 SolidWorks 的 .sldprt（{sw.type_name or sw.app}）")
+            check(suggest_category(".sldprt", sw.type_name, sw.app) == "三维模型",
+                  "本机 .sldprt 被建议归入三维模型")
+        pro_count = sum(
+            1 for i in found
+            if suggest_category(i.ext, i.type_name, i.app) in PRO_CATEGORIES
+        )
+        check(pro_count > 20, f"其中 {pro_count} 种能猜出专业分类")
+    else:
+        print("     （非 Windows，跳过注册表发现测试）")
+
+    # ---- 递归扫描与数量上限 ----
+    from app.scanner import scan_with_meta
+
+    deep_root = tmp / "递归测试"
+    (deep_root / "a" / "b" / "c").mkdir(parents=True)
+    for i in range(5):
+        (deep_root / f"顶层{i}.txt").write_text("x", encoding="utf-8")
+        (deep_root / "a" / f"一层{i}.txt").write_text("x", encoding="utf-8")
+        (deep_root / "a" / "b" / f"二层{i}.txt").write_text("x", encoding="utf-8")
+    for i in range(20):
+        (deep_root / "a" / "b" / "c" / f"深层{i}.txt").write_text("x", encoding="utf-8")
+
+    check(len(scan(deep_root)) == 6, f"不递归只扫顶层 6 项（实际 {len(scan(deep_root))}）")
+    full = scan(deep_root, recursive=True, include_dirs=False)
+    check(len(full) == 35, f"递归拿到全部 35 个文件（实际 {len(full)}）")
+
+    capped = scan_with_meta(deep_root, recursive=True, include_dirs=False, max_items=12)
+    check(len(capped.entries) == 12 and capped.truncated,
+          f"数量上限生效且被标记为截断（{len(capped.entries)} 项，truncated={capped.truncated}）")
+    names = {e.name for e in capped.entries}
+    check(all(f"顶层{i}.txt" in names for i in range(5)),
+          "浅层文件优先进入结果（截断后最先丢的是深层文件）")
+    check(not any(n.startswith("深层") for n in names), "深层文件先被截掉")
+
+    over = scan_with_meta(deep_root, recursive=True, include_dirs=False, max_items=1000)
+    check(not over.truncated, "没到上限时不标记截断")
+
     shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + "=" * 46)
     if FAILED:

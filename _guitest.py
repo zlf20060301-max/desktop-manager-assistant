@@ -202,8 +202,113 @@ def main() -> int:
           "关闭内容搜索后按文件名搜仍然正常")
     check(win2.table.isColumnHidden(COL_HIT), "关闭后命中列重新隐藏")
 
-    win2.close()
+    # 索引规模闸门：打开「含子文件夹」后可能有一万多个文档，
+    # 不能不打一声招呼就开始读盘
+    from app.ui.main_window import LARGE_INDEX_WARN
 
+    saved_count = win2._searchable_count
+    win2._searchable_count = lambda: LARGE_INDEX_WARN * 5
+    check(win2._confirm_index_scale(first_time=True) is True,
+          f"文档超过 {LARGE_INDEX_WARN} 时会先弹确认框（测试里自动接受）")
+    check(win2._confirm_index_scale(first_time=False) is True, "非首次不再重复询问")
+    win2._searchable_count = saved_count
+    check(win2._confirm_index_scale(first_time=True) is True,
+          "文档数量正常时不弹框，直接通过")
+
+    # 索引清理：文件没了，索引记录不能永远留着
+    from app.extract import STATUS_OK, ExtractResult
+
+    idx2 = win2.content_index()
+    stale = docs_dir / "已删除的文档.txt"
+    idx2.put(stale, 1.0, 4, ".txt", ExtractResult(STATUS_OK, "临时内容在索引里"))
+    check(bool(idx2.search("临时内容在索引里")), "临时造了一条索引记录")
+    win2._prune_index()
+    check(not idx2.search("临时内容在索引里"),
+          "_prune_index 清掉了磁盘上已不存在文件的记录")
+
+    print("\n8) 文件类型管理（走真实界面）")
+    from PySide6.QtWidgets import QDialog
+
+    from app.categorizer import PRO_CATEGORIES
+    from app.ui.filetype_dialog import FileTypeDialog, ScanDialog
+
+    ft_dir = tmp / "类型测试"
+    ft_dir.mkdir()
+    for name in ("零件.SLDPRT", "图纸.dwg", "论文.docx", "杂项.zzq"):
+        (ft_dir / name).write_text("x", encoding="utf-8")
+
+    cfg3 = Config(desktop_dir=str(ft_dir), rules=Config().rules,
+                  path=tmp / "config3.json")
+    win3 = MainWindow(cfg3, Journal(tmp / "journal3.json"), data_dir=tmp / "d3")
+
+    got = {e.name: e.category for e in win3.entries}
+    check(got.get("零件.SLDPRT") == "三维模型", f"主界面把 .SLDPRT 归为三维模型（{got}）")
+    check(got.get("图纸.dwg") == "CAD图纸", ".dwg 归为 CAD图纸")
+    check(got.get("杂项.zzq") == "其他", "未知后缀归「其他」")
+
+    def sidebar_cats(w):
+        return [w.cat_list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(w.cat_list.count())]
+
+    check("三维模型" in sidebar_cats(win3), f"侧栏出现三维模型（{sidebar_cats(win3)}）")
+
+    # 打开管理对话框，模拟用户加后缀 + 新建分类
+    dlg = FileTypeDialog(cfg3, win3)
+    check("三维模型" in dlg._categories(), "管理界面列出了三维模型分类")
+    check(len(dlg.ext_map) > 300, f"管理界面载入 {len(dlg.ext_map)} 条后缀映射")
+    check(dlg.ext_map.get(".sldprt") == "三维模型", "管理界面里 .sldprt 的归类正确")
+
+    dlg.ext_map[".zzq"] = "三维模型"                     # 相当于「添加后缀」
+    dlg.ext_map[".dwg"] = "我的图纸"                     # 相当于改归到新分类
+    dlg.custom.append({"name": "我的图纸", "icon": "📐"})  # 相当于「新建分类」
+    dlg.changed = True
+    dlg._save()
+    check(dlg.result() == QDialog.DialogCode.Accepted.value or dlg.result() == 1,
+          "保存后对话框返回接受")
+
+    check(cfg3.ext_overrides.get(".zzq") == "三维模型", "新增后缀写进配置")
+    check(cfg3.ext_overrides.get(".dwg") == "我的图纸", "改动内置后缀也写进配置")
+    check(".docx" not in cfg3.ext_overrides, "没动过的项不写进配置")
+    check(cfg3.custom_categories == [{"name": "我的图纸", "icon": "📐"}],
+          f"自定义分类写进配置：{cfg3.custom_categories}")
+
+    # 主窗口重新加载后要生效
+    win3._reload_categories()
+    got2 = {e.name: e.category for e in win3.entries}
+    check(got2.get("杂项.zzq") == "三维模型", f"重扫后自定义后缀生效（{got2}）")
+    check(got2.get("图纸.dwg") == "我的图纸", "自定义分类生效")
+    check(any(r.category == "我的图纸" for r in cfg3.rules), "自定义分类进了归档规则表")
+    check("我的图纸" in sidebar_cats(win3), "自定义分类出现在侧栏")
+    check(win3.model._icon("我的图纸") == "📐", "表格用的是自定义图标")
+    check(win3.model._icon("三维模型") == "🧊", "内置分类图标没被弄坏")
+
+    # 扫描对话框（读真实注册表）
+    from app import winfiletypes
+
+    if winfiletypes.available():
+        scan_dlg = ScanDialog(dlg.ext_map, dlg._categories(), win3)
+        deadline2 = time.time() + 90
+        while time.time() < deadline2:
+            app.processEvents()
+            if scan_dlg._rows:
+                break
+            time.sleep(0.05)
+        check(bool(scan_dlg._rows), f"扫描对话框读到 {len(scan_dlg._rows)} 种本机文件类型")
+        check(scan_dlg.table.rowCount() > 20,
+              f"默认视图列出 {scan_dlg.table.rowCount()} 行（只显示有专业分类建议的）")
+        # 勾选并收集
+        scan_dlg._set_all(True)
+        picked_before = sum(
+            1 for r in range(scan_dlg.table.rowCount())
+            if scan_dlg.table.item(r, 0).checkState() == Qt.CheckState.Checked
+        )
+        check(picked_before == scan_dlg.table.rowCount(), "全选后所有可见行都勾上")
+        scan_dlg.close()
+    else:
+        print("     （非 Windows，跳过扫描对话框测试）")
+
+    win3.close()
+    win2.close()
     win.close()
     shutil.rmtree(tmp, ignore_errors=True)
 

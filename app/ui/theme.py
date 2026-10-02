@@ -2,24 +2,13 @@
 
 from __future__ import annotations
 
-CATEGORY_ICON: dict[str, str] = {
-    "文档": "📄",
-    "表格": "📊",
-    "演示": "📽️",
-    "PDF": "📕",
-    "图片": "🖼️",
-    "音视频": "🎬",
-    "压缩包": "🗜️",
-    "程序": "⚙️",
-    "代码": "💻",
-    "快捷方式": "🔗",
-    "文件夹": "📁",
-    "其他": "📦",
-}
+from ..icons import BUILTIN_ICONS, CUSTOM_ICON_CHOICES
+
+CATEGORY_ICON: dict[str, str] = dict(BUILTIN_ICONS)
 
 
 def category_icon(cat: str) -> str:
-    return CATEGORY_ICON.get(cat, "📦")
+    return CATEGORY_ICON.get(cat, "🗂️")
 
 
 QSS = """

@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
 from PySide6.QtGui import QColor, QFont
 
+from ..categorizer import CategoryMap
 from ..scanner import Entry, human_size
 from .theme import category_icon
 
@@ -30,6 +31,18 @@ class FileTableModel(QAbstractTableModel):
         super().__init__(parent)
         self._entries: list[Entry] = list(entries or [])
         self._hits: dict[str, tuple[str, int]] = {}
+        self._cats: CategoryMap | None = None
+
+    def set_category_map(self, cats: CategoryMap) -> None:
+        """换成带用户自定义的分类映射，用于取分类图标。"""
+        self._cats = cats
+        if self._entries:
+            top = self.index(0, COL_CAT)
+            bottom = self.index(len(self._entries) - 1, COL_CAT)
+            self.dataChanged.emit(top, bottom, [Qt.ItemDataRole.DisplayRole])
+
+    def _icon(self, category: str) -> str:
+        return self._cats.icon(category) if self._cats is not None else category_icon(category)
 
     # ---------- 数据源 ----------
 
@@ -86,7 +99,7 @@ class FileTableModel(QAbstractTableModel):
             if col == COL_NAME:
                 return e.name
             if col == COL_CAT:
-                return f"{category_icon(e.category)} {e.category}"
+                return f"{self._icon(e.category)} {e.category}"
             if col == COL_TYPE:
                 return e.suffix
             if col == COL_SIZE:
