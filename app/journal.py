@@ -45,7 +45,8 @@ class Journal:
         if not self.path.is_file():
             return
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            # utf-8-sig：容忍带 BOM 的文件（外部工具改写时可能出现）
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except Exception:
             return
         for item in raw.get("batches", []):

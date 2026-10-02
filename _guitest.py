@@ -8,6 +8,7 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -138,6 +139,70 @@ def main() -> int:
     check([e.name for e in win.selected_entries()] == ["辛.txt"], "精确定位到 辛.txt")
     win.delete_selected()
     check(not (sandbox / "辛.txt").exists(), "辛.txt 已离开桌面（进回收站）")
+
+    print("\n7) 内容搜索（走真实界面）")
+    import _fixtures as fx
+    from app.ui.file_model import COL_HIT
+
+    docs_dir = tmp / "文档样本"
+    fx.build_all(docs_dir)
+    docs_data = tmp / "docs_data"
+    cfg2 = Config(desktop_dir=str(docs_dir), rules=Config().rules,
+                  path=tmp / "config2.json")
+    win2 = MainWindow(cfg2, Journal(tmp / "journal2.json"), data_dir=docs_data)
+
+    check(win2.table.isColumnHidden(COL_HIT), "内容搜索未开启时命中列是隐藏的")
+    check(win2.cfg.content_search is False, "默认不开启内容搜索")
+
+    win2.chk_content.setChecked(True)
+    check(win2.table.isColumnHidden(COL_HIT) is False, "开启后命中列显示出来")
+
+    # 等后台索引线程跑完
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        app.processEvents()
+        if win2._indexer is None:
+            break
+        time.sleep(0.05)
+    check(win2._indexer is None, "后台索引线程已正常结束")
+    st = win2.content_index().stats()
+    check(st.ok >= 6, f"索引里有 {st.ok} 个可搜索文档（error {st.error}）")
+    check((docs_data / "content_index.db").is_file(), "索引库写到了指定的数据目录")
+
+    # 按正文搜索：文件名里没有「有限元」这三个字
+    win2.search.setText("有限元")
+    win2._run_content_search()
+    names = [e.name for e in win2.visible_entries()]
+    check(names == ["预算表.xlsx"], f"按正文内容筛出 {names}")
+
+    row = win2.model.hit_for(win2.visible_entries()[0])
+    check(row is not None and "有限元" in row[0], f"命中片段：{row[0] if row else None}")
+
+    win2.table.selectRow(0)
+    app.processEvents()
+    check("命中" in win2.info_bar.text(), f"底部信息条显示命中上下文：{win2.info_bar.text()[:60]}")
+
+    # 搜一个只存在于正文里的中文词
+    win2.search.setText("海外市场")
+    win2._run_content_search()
+    check([e.name for e in win2.visible_entries()] == ["季度汇报.pptx"], "PPT 正文可搜")
+
+    # 搜不到的词
+    win2.search.setText("完全不存在的词啊")
+    win2._run_content_search()
+    check(win2.proxy.rowCount() == 0, "搜不到时列表为空")
+    check("没有找到包含该内容" in win2.info_bar.text(), "搜不到时有明确提示")
+
+    # 关掉内容搜索后回到文件名搜索
+    win2.search.setText("预算")
+    win2.chk_content.setChecked(False)
+    win2._search_timer.stop()
+    win2.proxy.set_keyword("预算")
+    check([e.name for e in win2.visible_entries()] == ["预算表.xlsx"],
+          "关闭内容搜索后按文件名搜仍然正常")
+    check(win2.table.isColumnHidden(COL_HIT), "关闭后命中列重新隐藏")
+
+    win2.close()
 
     win.close()
     shutil.rmtree(tmp, ignore_errors=True)

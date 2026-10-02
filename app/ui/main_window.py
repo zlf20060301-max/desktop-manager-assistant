@@ -6,7 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QUrl, Qt
+from PySide6.QtCore import QModelIndex, QTimer, QUrl, Qt
 from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -29,30 +29,61 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import Config
+from ..config import DATA_DIR, Config
+from ..content_index import ContentIndex, describe_status, index_path_for
 from ..fileops import is_within, recycle, undo_batch
 from ..journal import Journal
 from ..scanner import Entry, category_counts, human_size, scan
 from .archive_dialog import ArchiveDialog
-from .file_model import FileTableModel, EntryFilterProxy
+from .file_model import (
+    COL_CAT,
+    COL_HIT,
+    COL_NAME,
+    COL_PATH,
+    COL_SIZE,
+    COL_TIME,
+    COL_TYPE,
+    EntryFilterProxy,
+    FileTableModel,
+)
+from .indexer import IndexWorker
 from .rename_dialog import RenameDialog
 from .theme import QSS, category_icon
 
+SEARCH_PLACEHOLDER = "搜索文件名 / 分类 / 路径…（Ctrl+F）"
+SEARCH_PLACEHOLDER_CONTENT = "搜索文件名 / 分类 / 路径 / 文档正文…（Ctrl+F）"
+
 
 class MainWindow(QMainWindow):
-    def __init__(self, cfg: Config, journal: Journal | None = None) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        journal: Journal | None = None,
+        data_dir: Path | str | None = None,
+    ) -> None:
         super().__init__()
         self.cfg = cfg
         self.journal = journal if journal is not None else Journal()
+        # 内容索引库放哪。测试和多套环境可以指到别处，避免污染真实索引。
+        self._data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
         self.entries: list[Entry] = []
 
+        # 内容搜索相关状态。索引库按需创建，不用内容搜索就不建库。
+        self._index: ContentIndex | None = None
+        self._indexer: IndexWorker | None = None
+        self._hits: dict[str, tuple[str, int]] = {}
+
         self.setWindowTitle("桌面管家 — 桌面文档管理")
-        self.resize(1280, 780)
-        self.setMinimumSize(960, 600)
+        self.resize(1360, 800)
+        self.setMinimumSize(1000, 620)
 
         self._build_ui()
         self._build_shortcuts()
         self.rescan()
+
+        # 恢复上次的内容搜索开关状态
+        if self.cfg.content_search:
+            self.chk_content.setChecked(True)
 
     # ==================================================================
     # 界面搭建
@@ -93,21 +124,33 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(28)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for c in (1, 2, 3, 4):
+        hh.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
+        for c in (COL_CAT, COL_TYPE, COL_SIZE, COL_TIME):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(5, 320)
+        hh.setSectionResizeMode(COL_HIT, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(COL_PATH, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(COL_PATH, 260)
+        self.table.setColumnHidden(COL_HIT, True)   # 内容搜索开启后才显示
         self.table.doubleClicked.connect(lambda _i: self.open_selected())
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
-        self.table.selectionModel().selectionChanged.connect(self._update_status)
+        self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
         rl.addWidget(self.table, 1)
 
-        self.empty_hint = QLabel("")
-        self.empty_hint.setObjectName("Hint")
-        self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        rl.addWidget(self.empty_hint)
+        # 底部信息条：平时给空结果提示，内容搜索时显示命中上下文
+        self.info_bar = QLabel("")
+        self.info_bar.setObjectName("Hint")
+        self.info_bar.setWordWrap(True)
+        self.info_bar.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.info_bar.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.info_bar.setMinimumHeight(38)
+        rl.addWidget(self.info_bar)
+
+        # 搜索防抖：每敲一个字就查一遍数据库太浪费
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(180)
+        self._search_timer.timeout.connect(self._run_content_search)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
@@ -155,11 +198,20 @@ class MainWindow(QMainWindow):
         h.setSpacing(8)
 
         self.search = QLineEdit()
-        self.search.setPlaceholderText("搜索文件名 / 分类 / 路径…（Ctrl+F）")
+        self.search.setPlaceholderText(SEARCH_PLACEHOLDER)
         self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(lambda t: self.proxy.set_keyword(t))
+        self.search.textChanged.connect(self._on_search_text)
         self.search.setMinimumWidth(280)
         h.addWidget(self.search)
+
+        self.chk_content = QCheckBox("搜内容")
+        self.chk_content.setToolTip(
+            "在文档正文里搜索，而不只是文件名。\n"
+            "支持 Word / Excel / PPT / PDF / txt / 代码等；\n"
+            "首次开启会在后台建立索引，之后是增量的。"
+        )
+        self.chk_content.toggled.connect(self._on_content_toggled)
+        h.addWidget(self.chk_content)
 
         self.chk_files = QCheckBox("只看文件")
         self.chk_files.toggled.connect(self.proxy.set_files_only)
@@ -238,7 +290,13 @@ class MainWindow(QMainWindow):
         self.lbl_path.setText(f"当前目录：{root}")
         self._rebuild_categories()
         self._update_status()
+        self._update_info_bar()
         self.table.setFocus()
+
+        # 开了内容搜索就把新增/改动过的文档补进索引
+        if self.chk_content.isChecked():
+            self.start_indexing()
+            self._run_content_search()
 
     def _rebuild_categories(self) -> None:
         counts = category_counts(self.entries)
@@ -304,11 +362,160 @@ class MainWindow(QMainWindow):
     def _on_category_changed(self, *_args) -> None:
         self.proxy.set_category(self._current_category())
         self._update_status()
+        self._update_info_bar()
 
     def _on_hidden_toggled(self, flag: bool) -> None:
         self.cfg.show_hidden = bool(flag)
         self.cfg.save()
         self.rescan()
+
+    def _on_selection_changed(self, *_args) -> None:
+        self._update_status()
+        self._update_info_bar()
+
+    def _on_search_text(self, text: str) -> None:
+        self.proxy.set_keyword(text)
+        if self.chk_content.isChecked():
+            self._search_timer.start()      # 防抖后再查内容
+        else:
+            self._update_status()
+            self._update_info_bar()
+
+    # ==================================================================
+    # 内容搜索
+    # ==================================================================
+
+    def content_index(self) -> ContentIndex:
+        """内容索引库。用不到内容搜索就不会创建这个文件。"""
+        if self._index is None:
+            self._index = ContentIndex(index_path_for(self._data_dir))
+        return self._index
+
+    def _on_content_toggled(self, flag: bool) -> None:
+        self.cfg.content_search = bool(flag)
+        self.cfg.save()
+
+        self.proxy.set_content_mode(flag)
+        self.table.setColumnHidden(COL_HIT, not flag)
+        self.search.setPlaceholderText(
+            SEARCH_PLACEHOLDER_CONTENT if flag else SEARCH_PLACEHOLDER
+        )
+
+        if flag:
+            self.start_indexing()
+            self._run_content_search()
+        else:
+            self._search_timer.stop()
+            self._hits = {}
+            self.model.set_hits({})
+            self.proxy.set_hits({})
+            self.status.clearMessage()
+            self._update_status()
+            self._update_info_bar()
+
+    def start_indexing(self, *, force: bool = False) -> None:
+        """在后台把新增/改动过的文档补进索引。"""
+        if force:
+            self.content_index().clear()
+            self._hits = {}
+            self.model.set_hits({})
+            self.proxy.set_hits({})
+
+        self._stop_indexing()
+        worker = IndexWorker(self.content_index(), self.entries, self)
+        worker.progress.connect(self._on_index_progress)
+        worker.completed.connect(self._on_index_completed)
+        self._indexer = worker
+        worker.start()
+
+    def _stop_indexing(self) -> None:
+        worker, self._indexer = self._indexer, None
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait(5000)
+
+    def _on_index_progress(self, done: int, total: int) -> None:
+        if total:
+            self.status.showMessage(f"正在提取文档正文… {done}/{total}", 0)
+
+    def _on_index_completed(self, added: int, skipped: int, failed: int) -> None:
+        worker, self._indexer = self._indexer, None
+        if worker is not None:
+            worker.wait(3000)        # 确认线程真的退出了再回收，避免 Qt 警告
+            worker.deleteLater()
+        self.status.clearMessage()
+        if added or failed:
+            self._run_content_search()   # 索引进度变了，重跑一次当前查询
+        self._update_status()
+        self._update_info_bar()
+
+    def _run_content_search(self) -> None:
+        query = self.search.text().strip()
+        if not self.chk_content.isChecked() or not query:
+            self._hits = {}
+            self.model.set_hits({})
+            self.proxy.set_hits({})
+            self._update_status()
+            self._update_info_bar()
+            return
+
+        try:
+            self._hits = self.content_index().search(query)
+        except Exception:  # noqa: BLE001 - 索引库出问题也不该让界面崩
+            self._hits = {}
+        self.model.set_hits(self._hits)
+        self.proxy.set_hits(self._hits)
+        self._update_status()
+        self._update_info_bar()
+        self._select_first_hit_if_none()
+
+    def _select_first_hit_if_none(self) -> None:
+        """筛完如果没选中任何行，自动选第一条，方便直接看命中上下文。"""
+        if self.proxy.rowCount() and not self.table.selectionModel().selectedRows():
+            self.table.selectRow(0)
+
+    def rebuild_index(self) -> None:
+        ok = QMessageBox.question(
+            self,
+            "重建内容索引",
+            "将清空已提取的文档正文并重新索引当前目录。\n"
+            "文件本身不会被改动，只是多花一点时间重新读取。\n\n是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        if not self.chk_content.isChecked():
+            self.chk_content.setChecked(True)
+        self.start_indexing(force=True)
+        self.status.showMessage("正在重建内容索引…", 0)
+
+    def _update_info_bar(self) -> None:
+        chk = getattr(self, "chk_content", None)
+        content_on = bool(chk and chk.isChecked())
+        query = self.search.text().strip() if hasattr(self, "search") else ""
+        total = self.proxy.rowCount() if hasattr(self, "proxy") else 0
+
+        lines: list[str] = []
+        if content_on and total == 0 and query:
+            lines.append("没有找到包含该内容的文档。")
+        elif not content_on and total == 0:
+            lines.append("没有匹配的条目，试试清空搜索或切换分类。")
+
+        selected = self.selected_entries() if hasattr(self, "table") else []
+        if content_on and len(selected) == 1:
+            e = selected[0]
+            hit = self.model.hit_for(e)
+            if hit:
+                lines.append(f"命中 {hit[1]} 处　{hit[0]}")
+            else:
+                status, note = ("", "")
+                if self._index is not None:
+                    status, note = self._index.note_for(e.path)
+                lines.append("未命中内容 · " + describe_status(status, note, e.ext))
+
+        if hasattr(self, "info_bar"):
+            self.info_bar.setText("\n".join(lines))
 
     def _select_all(self) -> None:
         self.table.selectAll()
@@ -321,10 +528,11 @@ class MainWindow(QMainWindow):
         text = f"共 {all_count} 项"
         if total != all_count:
             text += f"（当前筛选 {total} 项）"
+        if self.chk_content.isChecked() and self._hits:
+            text += f" · 内容命中 {len(self._hits)} 个文档"
         text += f" · 占用 {human_size(size)} · 目录 {self.cfg.desktop_dir}"
         self.lbl_stats.setText(text)
         self.lbl_sel.setText(f"已选中 {sel} 项" if sel else "")
-        self.empty_hint.setText("没有匹配的条目，试试清空搜索或切换分类。" if total == 0 else "")
         self.btn_undo.setEnabled(self.journal.last_undoable() is not None)
         has_sel = sel > 0
         self.btn_rename.setEnabled(has_sel)
@@ -463,8 +671,21 @@ class MainWindow(QMainWindow):
         menu.addAction("复制完整路径", self.copy_paths)
         menu.addAction("复制文件名", self.copy_names)
         menu.addSeparator()
+        if self.chk_content.isChecked():
+            menu.addAction("重建内容索引…", self.rebuild_index)
         menu.addAction("移入回收站", self.delete_selected)
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """退出前停掉后台索引线程、关掉数据库，避免留下半截写入。"""
+        self._search_timer.stop()
+        self._stop_indexing()
+        if self._index is not None:
+            self._index.close()
+            self._index = None
+        super().closeEvent(event)
 
 
 def apply_theme(app: QApplication) -> None:

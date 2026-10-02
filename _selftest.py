@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -219,8 +220,126 @@ def main() -> int:
                          {"文档": "文档"}, sandbox, POLICY_RENAME)
     check(all(not p.runnable for p in plan6), "外部文件不会被归档进目标目录")
 
-    # ---------- 8. 配置写入隔离 ----------
-    print("\n8) 配置写入隔离（防止测试/多环境覆盖真实配置）")
+    # ---------- 8. 文档内容提取与内容搜索 ----------
+    print("\n8) 文档内容提取与内容搜索")
+    import _fixtures as fx
+    from app.content_index import (
+        ContentIndex,
+        describe_status,
+        make_snippet,
+        terms_of,
+    )
+    from app.extract import extract, is_supported
+
+    docs_dir = tmp / "文档样本"
+    files = fx.build_all(docs_dir)
+
+    # 9.1 各种格式都能抠出正文
+    expect = {
+        "docx": "桌面管理助手",
+        "xlsx": "机械结构有限元分析预算",
+        "pptx": "营收同比增长",
+        "pdf": "Project Acceptance Report",
+        "txt_utf8": "桌面整理",
+        "txt_gbk": "发票归档",
+        "rtf": "项目验收报告",
+    }
+    for key, needle in expect.items():
+        r = extract(files[key])
+        check(r.status == "ok" and needle in r.text,
+              f"{key} 提取到「{needle}」（状态 {r.status}）")
+
+    # RTF 的两种转义都要还原，且汉字不能被空格拆开
+    rtf_text = extract(files["rtf"]).text
+    check("项目验收" in rtf_text, "RTF 的 \\uNNNN 转义已还原且汉字连续")
+    check("报告" in rtf_text, "RTF 的 \\'xx GBK 转义已还原")
+    check("SimSun" not in rtf_text, "RTF 字体表没有泄漏进正文")
+
+    # 9.2 坏文件不能把索引搞崩
+    bad = extract(files["corrupt"])
+    check(bad.status == "error", f"损坏的 docx 返回 error（实际 {bad.status}）")
+    legacy = extract(files["legacy"])
+    check(legacy.status == "unsupported", "老版 .doc 标记为不支持")
+    check("老版 Office" in describe_status("", "", ".doc"), "老版格式有可读的原因说明")
+    check(not is_supported(".doc") and is_supported(".pdf"), "格式支持判断正确")
+
+    # 9.3 建索引
+    entries = scan(docs_dir)
+    idx = ContentIndex(tmp / "content_index.db")
+    added, skipped, failed = idx.ensure(entries)
+    check(added == 7, f"首次索引了 7 个文档（实际 {added}）")
+    check(failed == 1, f"只有那个故意损坏的 docx 失败（实际 {failed}）")
+    check("损坏的.docx" in {Path(k).name for k in
+                            [r[0] for r in idx._conn.execute("SELECT path FROM docs WHERE status='error'")]},
+          "损坏的文件被记成 error 而不是让整轮索引中断")
+
+    # 9.4 增量：内容没变就不重复提取
+    added2, skipped2, _ = idx.ensure(scan(docs_dir))
+    check(added2 == 0 and skipped2 >= 7, f"第二次索引全部跳过（新增 {added2}，跳过 {skipped2}）")
+
+    # 9.5 文件被改过就要重新提取
+    docx_path = files["docx"]
+    time.sleep(1.05)                       # 让 mtime 确实变化（部分文件系统精度到秒）
+    fx.make_docx(docx_path, ["改过之后的正文", "新增关键词：橙子计划"])
+    added3, _, _ = idx.ensure(scan(docs_dir))
+    check(added3 == 1, f"文件改动后重新索引 1 个（实际 {added3}）")
+    check(bool(idx.search("橙子计划")), "改动后的新内容能被搜到")
+
+    # 9.6 核心：只靠正文内容找出文档（文件名里根本没这些字）
+    hits = idx.search("有限元")
+    hit_names = {Path(p).name for p in hits}
+    check(hit_names == {"预算表.xlsx"}, f"按正文搜「有限元」命中 {hit_names}")
+    key = str(files["xlsx"]).lower()
+    check(key in hits and "有限元" in hits[key][0], "命中的是内容片段而不是文件名")
+    # 键必须是小写的：界面查表用的就是小写路径，不统一的话
+    # C:\Users\... 这种带大写的路径永远查不中（GUI 测试抓到过这个 bug）
+    check(all(k == k.lower() for k in hits), "返回的路径键统一为小写")
+
+    hits = idx.search("海外市场")
+    check({Path(p).name for p in hits} == {"季度汇报.pptx"}, "按正文搜 PPT 内容命中")
+
+    hits = idx.search("Acceptance")
+    check({Path(p).name for p in hits} == {"验收报告.pdf"}, "英文大小写不敏感地搜 PDF 内容")
+
+    hits = idx.search("发票归档")
+    check({Path(p).name for p in hits} == {"老文件.txt"}, "GBK 编码的老文件也能搜到")
+
+    hits = idx.search("项目验收")
+    check({Path(p).name for p in hits} == {"备忘.rtf"}, "RTF 内容可搜")
+
+    # 9.7 搜不存在的词
+    check(idx.search("这个词肯定不存在于任何文档") == {}, "搜不到时返回空")
+    check(idx.search("   ") == {}, "空白查询返回空")
+
+    # 9.8 多词是「都要出现」
+    check(bool(idx.search("预算 有限元")), "多词 AND：两个词都在时命中")
+    check(not idx.search("预算 橙子计划"), "多词 AND：只满足一个时不命中")
+
+    # 9.9 片段与计数
+    long_text = "前" * 60 + "关键命中词" + "后" * 200
+    snip = make_snippet(long_text, "关键命中词")
+    check("关键命中词" in snip, "片段里包含关键词")
+    check(snip.startswith("…") and snip.endswith("…"), f"片段两端有省略号（{snip[:12]}…{snip[-6:]}）")
+    check("\n" not in snip, "片段里的换行被压掉了")
+    check(make_snippet("命中就在开头" + "尾" * 200, "命中").startswith("命中"),
+          "命中在开头时不加前置省略号")
+    check(terms_of("甲 乙  丙") == ["甲", "乙", "丙"], "查询词拆分正确")
+    check(terms_of("  ") == [], "空白查询拆出空列表")
+    check(idx.search("预算")[str(files["xlsx"]).lower()][1] == 1, "命中次数统计正确")
+
+    # 9.10 删掉的文件不留残渣
+    removed_file = files["txt_utf8"]
+    removed_file.unlink()
+    pruned = idx.prune(docs_dir, [e.path for e in scan(docs_dir)])
+    check(pruned == 1, f"清掉了 1 条失效记录（实际 {pruned}）")
+    check(idx.search("桌面整理") == {}, "已删除文件的内容不再被搜到")
+
+    st = idx.stats()
+    check(st.total >= 7 and st.ok >= 6, f"索引统计：{st}")
+    idx.close()
+
+    # ---------- 9. 配置写入隔离 ----------
+    print("\n9) 配置写入隔离（防止测试/多环境覆盖真实配置）")
     from app.config import CONFIG_PATH, Config
 
     before = CONFIG_PATH.read_bytes() if CONFIG_PATH.is_file() else None
@@ -229,6 +348,22 @@ def main() -> int:
     c.save()
     check(cfg_file.is_file(), "配置写到了指定的路径")
     check(Config.load(cfg_file).desktop_dir == str(sandbox), "从指定路径能读回一致内容")
+
+    # 带 BOM 的配置文件也必须能读（PowerShell / 记事本写出来就带 BOM）。
+    # 读不出来的话会被 except 吞掉，用户会莫名其妙丢掉全部设置。
+    bom_file = tmp / "cfg" / "bom_config.json"
+    bom_file.write_bytes(b"\xef\xbb\xbf" + cfg_file.read_bytes())
+    bom_cfg = Config.load(bom_file)
+    check(bom_cfg.desktop_dir == str(sandbox), "带 BOM 的 config.json 仍能正确读出目录")
+    check(len(bom_cfg.rules) == len(c.rules), "带 BOM 的 config.json 规则没有丢失")
+
+    # 日志文件同理
+    from app.journal import Journal as _J
+
+    j2 = tmp / "journal_bom.json"
+    j2.write_bytes(b"\xef\xbb\xbf" + (tmp / "journal.json").read_bytes())
+    check(len(_J(j2).batches) >= 1, "带 BOM 的操作台账仍能读出批次")
+
     after = CONFIG_PATH.read_bytes() if CONFIG_PATH.is_file() else None
     check(before == after, "真实 config.json 全程未被触碰")
 

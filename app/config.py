@@ -107,6 +107,7 @@ class Config:
     conflict_policy: str = "rename"  # rename | skip | overwrite
     show_hidden: bool = False
     recursive: bool = False
+    content_search: bool = False     # 是否默认开启「搜索文件内容」
     # 这份配置是从哪个文件读出来的，保存时就写回哪里。
     # 不能写死全局路径：否则测试、多套配置会互相覆盖。
     path: Path = field(default_factory=lambda: CONFIG_PATH, repr=False, compare=False)
@@ -119,7 +120,10 @@ class Config:
         cfg = Config(desktop_dir=str(known_desktop()), path=cfg_path)
         if cfg_path.is_file():
             try:
-                raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+                # utf-8-sig：PowerShell / 记事本写出来的 JSON 常带 BOM，
+                # 用 utf-8 读会把 BOM 留成 \ufeff 前缀导致解析失败，
+                # 然后被下面的 except 吞掉 —— 用户会莫名其妙丢掉全部设置。
+                raw = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
             except Exception:
                 raw = {}
             desktop = raw.get("desktop_dir")
@@ -136,6 +140,7 @@ class Config:
                 cfg.conflict_policy = pol
             cfg.show_hidden = bool(raw.get("show_hidden", False))
             cfg.recursive = bool(raw.get("recursive", False))
+            cfg.content_search = bool(raw.get("content_search", False))
         return cfg
 
     def save(self) -> None:
@@ -145,6 +150,7 @@ class Config:
             "conflict_policy": self.conflict_policy,
             "show_hidden": self.show_hidden,
             "recursive": self.recursive,
+            "content_search": self.content_search,
             "rules": [r.as_dict() for r in self.rules],
         }
         tmp = self.path.with_suffix(".json.tmp")
