@@ -161,16 +161,18 @@ cd desktop-manager-assistant
 ```
 DeskManager/
 ├── main.py                  程序入口
-├── 启动桌面管家.cmd          日常启动
+├── 安装到本机.cmd            把软件装到这台电脑（使用打包好的 exe）
+├── build.ps1                用 PyInstaller 打包成独立 exe
+├── 启动桌面管家.cmd          源码方式启动
 ├── 调试运行.cmd              带控制台的启动，排错用
-├── 安装依赖.cmd              首次安装 / 修复环境
+├── 安装依赖.cmd              开发环境：创建 .venv 并装 PySide6
 ├── config.example.json      配置范例（真实配置是 config.json，不入库）
-├── .gitignore
+├── .gitignore / .gitattributes
 ├── requirements.txt
 ├── app/
 │   ├── categorizer.py       扩展名 → 分类 的映射表
 │   ├── scanner.py           目录扫描 → Entry 列表
-│   ├── config.py            配置加载/保存、桌面路径探测
+│   ├── config.py            配置加载/保存、桌面路径探测、冻结环境判定
 │   ├── journal.py           操作台账（撤销用）
 │   ├── fileops.py           归档/重命名/撤销/回收站
 │   └── ui/
@@ -179,9 +181,19 @@ DeskManager/
 │       ├── archive_dialog.py 归档对话框
 │       ├── rename_dialog.py  重命名对话框
 │       └── theme.py         样式表
+├── installer/
+│   ├── install.ps1          安装：复制文件 + 快捷方式 + 注册卸载项
+│   ├── uninstall.ps1        卸载：清理 + 可选删除用户数据 + 自删除
+│   └── 卸载.cmd              安装目录里的卸载入口
+├── tools/make_icon.py       生成应用图标
+├── assets/                  icon.ico / icon.png
+├── build/ dist/             打包产物，不入库
 ├── data/                    运行数据（撤销台账、崩溃日志），不入库
 └── docs/                    截图
 ```
+
+> 所有 `.ps1` 都以 **UTF-8 BOM** 保存。Windows PowerShell 5.1 遇到无 BOM 的
+> UTF-8 文件会按 GBK 解析，中文注释会被打乱导致脚本报语法错误——改这些文件时请注意别把 BOM 弄丢。
 
 ---
 
